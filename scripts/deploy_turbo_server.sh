@@ -35,7 +35,7 @@ AZ_LOCATION="eastus2"
 AZ_RESOURCE_GROUP="rg-memquest"
 AZ_CONTAINERAPPS_ENV="memquest-env"
 ACA_SERVER_APP="memquest-server-turbo"
-SERVER_IMAGE="${TURBO_SERVER_IMAGE:-memquestacr.azurecr.io/memquest-server:v14-turbo}"
+SERVER_IMAGE="${TURBO_SERVER_IMAGE:-memquestacr.azurecr.io/memquest-server:v15-turbo}"
 
 # Set subscription
 say "Setting subscription to $AZ_SUBSCRIPTION_ID"
@@ -119,6 +119,38 @@ ENV_VARS=(
   "AZURE_SEARCH_API_KEY=${AZURE_SEARCH_API_KEY}"
   "LOG_LEVEL=${LOG_LEVEL}"
 )
+
+# Memory layer env vars (HOT/COLD architecture)
+if [[ -n "${MEMORY_ENABLED:-}" ]]; then
+  ENV_VARS+=("MEMORY_ENABLED=${MEMORY_ENABLED}")
+fi
+if [[ -n "${HOT_RETRIEVAL_ENABLED:-}" ]]; then
+  ENV_VARS+=("HOT_RETRIEVAL_ENABLED=${HOT_RETRIEVAL_ENABLED}")
+fi
+if [[ -n "${COLD_INGEST_ENABLED:-}" ]]; then
+  ENV_VARS+=("COLD_INGEST_ENABLED=${COLD_INGEST_ENABLED}")
+fi
+if [[ -n "${MEMORY_INDEX_NAME:-}" ]]; then
+  ENV_VARS+=("MEMORY_INDEX_NAME=${MEMORY_INDEX_NAME}")
+fi
+if [[ -n "${MEMORY_K:-}" ]]; then
+  ENV_VARS+=("MEMORY_K=${MEMORY_K}")
+fi
+if [[ -n "${AZURE_SEARCH_SEMANTIC_RANKER_ENABLED:-}" ]]; then
+  ENV_VARS+=("AZURE_SEARCH_SEMANTIC_RANKER_ENABLED=${AZURE_SEARCH_SEMANTIC_RANKER_ENABLED}")
+fi
+if [[ -n "${AZURE_SEARCH_SEMANTIC_CONFIG_NAME:-}" ]]; then
+  ENV_VARS+=("AZURE_SEARCH_SEMANTIC_CONFIG_NAME=${AZURE_SEARCH_SEMANTIC_CONFIG_NAME}")
+fi
+if [[ -n "${AZURE_SEARCH_VECTOR_DIM:-}" ]]; then
+  ENV_VARS+=("AZURE_SEARCH_VECTOR_DIM=${AZURE_SEARCH_VECTOR_DIM}")
+fi
+if [[ -n "${EVENT_HUBS_CONN_STR:-}" ]]; then
+  ENV_VARS+=("EVENT_HUBS_CONN_STR=${EVENT_HUBS_CONN_STR}")
+fi
+if [[ -n "${EVENT_HUBS_NAME:-}" ]]; then
+  ENV_VARS+=("EVENT_HUBS_NAME=${EVENT_HUBS_NAME}")
+fi
 
 # Optional vars (only sent when non-empty)
 if [[ -n "${GROK_DEPLOYMENT_NAME:-}" ]]; then

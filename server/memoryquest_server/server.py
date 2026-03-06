@@ -16,8 +16,12 @@ from agent_framework import ChatMessage
 warnings.filterwarnings("ignore", message="enable_cleanup_closed", category=DeprecationWarning)
 
 # Tools & Agents
-from agents.agent_framework_memory_agent import AgentFrameworkMemoryAgent
-from agents.cognee_agent import CogneeAgent
+from agents.agent_framework_memory_agent import AgentFrameworkMemoryAgent, INSTRUCTIONS as AGENT_INSTRUCTIONS
+try:
+    from agents.cognee_agent import CogneeAgent
+except Exception as _cognee_import_err:
+    CogneeAgent = None
+    print(f"  ⚠ Cognee import failed (will be unavailable): {_cognee_import_err}")
 from agents.hindsight_agent import HindsightAgent
 from agents.mem0_agent import Mem0Agent
 from agents.foundry_agent import FoundryAgent
@@ -69,6 +73,7 @@ class ChatRequest(BaseModel):
     username: str
     messages: List[Message] = Field(default_factory=list)
     query: Optional[str] = None
+    memory_mode: Literal["none", "standard", "hot-cold"] = "hot-cold"
 
 # --- Helper Functions ---
 
@@ -101,10 +106,13 @@ def _normalize_usage(usage: Any) -> Optional[dict[str, int]]:
         "totalTokenCount": total_count or 0,
     }
 
-def _create_system_context(username: str, messages: List[Message]) -> List[ChatMessage]:
+def _create_system_context(username: str, messages: List[Message], instructions: str | None = None) -> List[ChatMessage]:
     """Helper to convert API models to Agent Framework models."""
+    system_text = instructions or f"You are assisting user {username}"
+    if instructions:
+        system_text = f"{instructions}\n\nYou are assisting user {username}."
     return [
-        ChatMessage(role="system", text=f"You are assisting user {username}"),
+        ChatMessage(role="system", text=system_text),
         *(ChatMessage(role=m.role, text=m.content) for m in messages),
     ]
 
@@ -198,6 +206,8 @@ except Exception as e:
     print(f"  ✗ Mem0 agent failed to initialize: {e}")
 
 try:
+    if CogneeAgent is None:
+        raise RuntimeError("Cognee package failed to import")
     cognee_agent = CogneeAgent(deepseek_client).get_cognee_agent()
     print("  ✓ Cognee agent ready")
 except Exception as e:
@@ -310,24 +320,100 @@ def _unwrap_context_provider(agent):
 @app.post("/")
 async def generic_agent(request: ChatRequest):
     print(f"Generic Agent request: {request.username}")
-    messages = _create_system_context(request.username, request.messages)
+    t0 = time.monotonic()
+    messages = _create_system_context(request.username, request.messages, instructions=AGENT_INSTRUCTIONS)
 
     response = await gpt_4_client.get_response(messages)
     usage = _normalize_usage(response.usage_details)
+    elapsed_ms = round((time.monotonic() - t0) * 1000)
 
-    return {"message": response.messages[0].text, "usage": usage}
+    return {"message": response.messages[0].text, "usage": usage, "timing_ms": {"total": elapsed_ms, "memory_retrieve": 0, "memory_enqueue": 0, "llm": elapsed_ms}, "memory_mode": "none"}
+
+
+@app.post("/memories")
+async def generic_memories(request: ChatRequest):
+    return {"message": "No memory — the generic agent does not use memory. Select a memory framework to see memories."}
+
+
+@app.post("/compare")
+async def compare_modes(request: ChatRequest):
+    """Run the same prompt through all 3 memory modes sequentially for a fair comparison.
+
+    Running in parallel causes Azure OpenAI rate-limit contention — whichever
+    request is served last gets queued/throttled, skewing the numbers.
+    Sequential execution gives each mode uncontested throughput.
+    """
+    agent_fn = _resolve_agent_fn(request)
+
+    async def _run_none():
+        """No-memory path: use the same model + instructions, just no memory."""
+        t0 = time.monotonic()
+        messages = _create_system_context(request.username, request.messages, instructions=AGENT_INSTRUCTIONS)
+        response = await gpt_4_client.get_response(messages)
+        elapsed = round((time.monotonic() - t0) * 1000)
+        return {
+            "message": response.messages[0].text,
+            "timing_ms": {"total": elapsed, "memory_retrieve": 0, "memory_enqueue": 0, "llm": elapsed},
+            "memory_mode": "none",
+        }
+
+    async def _run_mode(mode):
+        """Run the selected agent endpoint with the given memory_mode."""
+        req_copy = ChatRequest(
+            username=request.username,
+            messages=request.messages,
+            query=request.query,
+            memory_mode=mode,
+        )
+        result = await agent_fn(req_copy)
+        return result
+
+    # Run sequentially: none → hot-cold → standard
+    # This order puts the expected-fastest first so cold-start bias
+    # (if any) works against our hypothesis, keeping results honest.
+    none_result = await _run_none()
+    hotcold_result = await _run_mode("hot-cold")
+    standard_result = await _run_mode("standard")
+
+    return {
+        "none": none_result,
+        "standard": standard_result,
+        "hot_cold": hotcold_result,
+    }
+
+
+def _resolve_agent_fn(request: ChatRequest):
+    """Map the current endpoint path hint to the correct agent function.
+
+    The compare endpoint needs to know *which* agent the user has selected.
+    We pass that via a special header or we can infer from a field.
+    For simplicity we add an optional 'agent' field on ChatRequest.
+    """
+    # We'll look at an extra query-param style field.  For now, we just
+    # use the request's query field as an agent name hint.
+    agent_name = (request.query or "agent-framework").lower().strip()
+    mapping = {
+        "agent-framework": agent_framework,
+        "mem0": mem0,
+        "cognee": cognee,
+        "hindsight": hindsight,
+        "foundry": foundry,
+    }
+    fn = mapping.get(agent_name, agent_framework)
+    return fn
 
 # --- Endpoints: Agent Framework (In-Memory State) ---
 
 @app.post("/agent-framework")
 async def agent_framework(request: ChatRequest):
-    print(f"Agent Framework request: {request.username}")
+    print(f"Agent Framework request: {request.username} memory_mode={request.memory_mode}")
+    t0 = time.monotonic()
+    timing = {"memory_retrieve": 0, "memory_enqueue": 0, "llm": 0}
     
     # Lifecycle: Load or Create Agent
     if request.username not in agent_framework_instances:
         print(f"Creating new stateful agent for: {request.username}")
         _evict_oldest_agent_instance()
-        # Note: In a production app, we would load this state from a database here
         agent_framework_instances[request.username] = AgentFrameworkMemoryAgent(client).get_agent_framework_memory_agent()
     
     agent = agent_framework_instances[request.username]
@@ -337,22 +423,52 @@ async def agent_framework(request: ChatRequest):
         agent_framework_threads[request.username] = agent.get_new_thread()
     
     thread = agent_framework_threads[request.username]
-    messages = _create_system_context(request.username, request.messages)
 
-    # HOT path: inject shared memory context
     user_query = request.messages[-1].content if request.messages else ""
-    mem_context = await _memory_retrieve(request.username, "agent-framework", user_query)
-    if mem_context:
-        messages.insert(1, ChatMessage(role="system", text=mem_context))
 
-    response = await agent.run(messages, thread=thread)
-    usage = _normalize_usage(response.usage_details)
+    if request.memory_mode == "hot-cold":
+        # Hot/Cold path: bypass agent.run() to skip inline memory extraction.
+        # Use the raw client with Azure Search memory injection (1 LLM call).
+        messages = _create_system_context(request.username, request.messages, instructions=AGENT_INSTRUCTIONS)
+        t_mem = time.monotonic()
+        mem_context = await _memory_retrieve(request.username, "agent-framework", user_query)
+        timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+        if mem_context:
+            messages.insert(1, ChatMessage(role="system", text=mem_context))
 
-    # COLD path: enqueue memory event (fire-and-forget)
-    if user_query:
+        t_llm = time.monotonic()
+        response = await client.get_response(messages)
+        timing["llm"] = round((time.monotonic() - t_llm) * 1000)
+        usage = _normalize_usage(response.usage_details)
+
+        t_enq = time.monotonic()
         await _memory_enqueue(request.username, "agent-framework", user_query)
-    
-    return {"message": response.messages[0].text, "usage": usage}
+        timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
+    else:
+        # Standard path: agent.run() with built-in memory (invoking/invoked)
+        # PLUS the shared Azure Search memory layer (retrieve + enqueue).
+        # This is the original design: agent's own memory + shared memory layer.
+        messages = _create_system_context(request.username, request.messages)
+
+        # HOT path: inject shared memory context before agent.run()
+        t_mem = time.monotonic()
+        mem_context = await _memory_retrieve(request.username, "agent-framework", user_query)
+        timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+        if mem_context:
+            messages.insert(1, ChatMessage(role="system", text=mem_context))
+
+        t_llm = time.monotonic()
+        response = await agent.run(messages, thread=thread)
+        timing["llm"] = round((time.monotonic() - t_llm) * 1000)
+        usage = _normalize_usage(response.usage_details)
+
+        # COLD path: enqueue memory event
+        t_enq = time.monotonic()
+        await _memory_enqueue(request.username, "agent-framework", user_query)
+        timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
+
+    timing["total"] = round((time.monotonic() - t0) * 1000)
+    return {"message": response.messages[0].text, "usage": usage, "timing_ms": timing, "memory_mode": request.memory_mode}
 
 @app.post("/agent-framework/memories")
 async def get_af_memories(request: ChatRequest):
@@ -379,24 +495,51 @@ async def get_af_memories(request: ChatRequest):
 @app.post("/mem0")
 async def mem0(request: ChatRequest):
     _ensure_agent_available(mem0_agent, "Mem0")
-    print(f"Mem0 request: {request.username}")
-    messages = _create_system_context(request.username, request.messages)
+    print(f"Mem0 request: {request.username} memory_mode={request.memory_mode}")
+    t0 = time.monotonic()
+    timing = {"memory_retrieve": 0, "memory_enqueue": 0, "llm": 0}
 
-    # HOT path: inject shared memory context
     user_query = request.messages[-1].content if request.messages else ""
-    mem_context = await _memory_retrieve(request.username, "mem0", user_query)
-    if mem_context:
-        messages.insert(1, ChatMessage(role="system", text=mem_context))
-    
-    # Mem0 handles state via Qdrant, we just pass the username
-    response = await mem0_agent.run(messages, username=request.username)
-    usage = _normalize_usage(response.usage_details)
 
-    # COLD path: enqueue memory event (fire-and-forget)
-    if user_query:
+    if request.memory_mode == "hot-cold":
+        # Hot/Cold path: bypass agent.run() to skip Mem0's inline vector ops.
+        messages = _create_system_context(request.username, request.messages, instructions=AGENT_INSTRUCTIONS)
+        t_mem = time.monotonic()
+        mem_context = await _memory_retrieve(request.username, "mem0", user_query)
+        timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+        if mem_context:
+            messages.insert(1, ChatMessage(role="system", text=mem_context))
+
+        t_llm = time.monotonic()
+        response = await client.get_response(messages)
+        timing["llm"] = round((time.monotonic() - t_llm) * 1000)
+        usage = _normalize_usage(response.usage_details)
+
+        t_enq = time.monotonic()
         await _memory_enqueue(request.username, "mem0", user_query)
-    
-    return {"message": response.messages[0].text, "usage": usage}
+        timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
+    else:
+        # Standard path: agent.run() with Mem0's built-in vector search + save
+        # PLUS the shared Azure Search memory layer (retrieve + enqueue).
+        messages = _create_system_context(request.username, request.messages)
+
+        t_mem = time.monotonic()
+        mem_context = await _memory_retrieve(request.username, "mem0", user_query)
+        timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+        if mem_context:
+            messages.insert(1, ChatMessage(role="system", text=mem_context))
+
+        t_llm = time.monotonic()
+        response = await mem0_agent.run(messages, username=request.username)
+        timing["llm"] = round((time.monotonic() - t_llm) * 1000)
+        usage = _normalize_usage(response.usage_details)
+
+        t_enq = time.monotonic()
+        await _memory_enqueue(request.username, "mem0", user_query)
+        timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
+
+    timing["total"] = round((time.monotonic() - t0) * 1000)
+    return {"message": response.messages[0].text, "usage": usage, "timing_ms": timing, "memory_mode": request.memory_mode}
 
 @app.post("/mem0/memories")
 async def mem0_get_memories(request: ChatRequest):
@@ -414,23 +557,51 @@ async def mem0_get_memories(request: ChatRequest):
 @app.post("/cognee")
 async def cognee(request: ChatRequest):
     _ensure_agent_available(cognee_agent, "Cognee")
-    print(f"Cognee request: {request.username}")
-    messages = _create_system_context(request.username, request.messages)
+    print(f"Cognee request: {request.username} memory_mode={request.memory_mode}")
+    t0 = time.monotonic()
+    timing = {"memory_retrieve": 0, "memory_enqueue": 0, "llm": 0}
 
-    # HOT path: inject shared memory context
     user_query = request.messages[-1].content if request.messages else ""
-    mem_context = await _memory_retrieve(request.username, "cognee", user_query)
-    if mem_context:
-        messages.insert(1, ChatMessage(role="system", text=mem_context))
 
-    response = await cognee_agent.run(messages, username=request.username)
-    usage = _normalize_usage(response.usage_details)
+    if request.memory_mode == "hot-cold":
+        # Hot/Cold path: bypass agent.run() to skip Cognee's inline graph ops.
+        messages = _create_system_context(request.username, request.messages, instructions=AGENT_INSTRUCTIONS)
+        t_mem = time.monotonic()
+        mem_context = await _memory_retrieve(request.username, "cognee", user_query)
+        timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+        if mem_context:
+            messages.insert(1, ChatMessage(role="system", text=mem_context))
 
-    # COLD path: enqueue memory event (fire-and-forget)
-    if user_query:
+        t_llm = time.monotonic()
+        response = await deepseek_client.get_response(messages)
+        timing["llm"] = round((time.monotonic() - t_llm) * 1000)
+        usage = _normalize_usage(response.usage_details)
+
+        t_enq = time.monotonic()
         await _memory_enqueue(request.username, "cognee", user_query)
+        timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
+    else:
+        # Standard path: agent.run() with Cognee's built-in graph memory
+        # PLUS the shared Azure Search memory layer (retrieve + enqueue).
+        messages = _create_system_context(request.username, request.messages)
 
-    return {"message": response.messages[0].text, "usage": usage}
+        t_mem = time.monotonic()
+        mem_context = await _memory_retrieve(request.username, "cognee", user_query)
+        timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+        if mem_context:
+            messages.insert(1, ChatMessage(role="system", text=mem_context))
+
+        t_llm = time.monotonic()
+        response = await cognee_agent.run(messages, username=request.username)
+        timing["llm"] = round((time.monotonic() - t_llm) * 1000)
+        usage = _normalize_usage(response.usage_details)
+
+        t_enq = time.monotonic()
+        await _memory_enqueue(request.username, "cognee", user_query)
+        timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
+
+    timing["total"] = round((time.monotonic() - t0) * 1000)
+    return {"message": response.messages[0].text, "usage": usage, "timing_ms": timing, "memory_mode": request.memory_mode}
 
 @app.post("/cognee/memories")
 async def cognee_get_memories(request: ChatRequest):
@@ -444,23 +615,51 @@ async def cognee_get_memories(request: ChatRequest):
 @app.post("/hindsight")
 async def hindsight(request: ChatRequest):
     _ensure_agent_available(hindsight_agent, "Hindsight")
-    print(f"Hindsight request: {request.username}")
-    messages = _create_system_context(request.username, request.messages)
+    print(f"Hindsight request: {request.username} memory_mode={request.memory_mode}")
+    t0 = time.monotonic()
+    timing = {"memory_retrieve": 0, "memory_enqueue": 0, "llm": 0}
 
-    # HOT path: inject shared memory context
     user_query = request.messages[-1].content if request.messages else ""
-    mem_context = await _memory_retrieve(request.username, "hindsight", user_query)
-    if mem_context:
-        messages.insert(1, ChatMessage(role="system", text=mem_context))
-    
-    response = await hindsight_agent.run(messages, username=request.username)
-    usage = _normalize_usage(response.usage_details)
 
-    # COLD path: enqueue memory event (fire-and-forget)
-    if user_query:
+    if request.memory_mode == "hot-cold":
+        # Hot/Cold path: bypass agent.run() to skip Hindsight's inline service calls.
+        messages = _create_system_context(request.username, request.messages, instructions=AGENT_INSTRUCTIONS)
+        t_mem = time.monotonic()
+        mem_context = await _memory_retrieve(request.username, "hindsight", user_query)
+        timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+        if mem_context:
+            messages.insert(1, ChatMessage(role="system", text=mem_context))
+
+        t_llm = time.monotonic()
+        response = await grok_client.get_response(messages)
+        timing["llm"] = round((time.monotonic() - t_llm) * 1000)
+        usage = _normalize_usage(response.usage_details)
+
+        t_enq = time.monotonic()
         await _memory_enqueue(request.username, "hindsight", user_query)
-    
-    return {"message": response.messages[0].text, "usage": usage}
+        timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
+    else:
+        # Standard path: agent.run() with Hindsight's built-in remember/reflect
+        # PLUS the shared Azure Search memory layer (retrieve + enqueue).
+        messages = _create_system_context(request.username, request.messages)
+
+        t_mem = time.monotonic()
+        mem_context = await _memory_retrieve(request.username, "hindsight", user_query)
+        timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+        if mem_context:
+            messages.insert(1, ChatMessage(role="system", text=mem_context))
+
+        t_llm = time.monotonic()
+        response = await hindsight_agent.run(messages, username=request.username)
+        timing["llm"] = round((time.monotonic() - t_llm) * 1000)
+        usage = _normalize_usage(response.usage_details)
+
+        t_enq = time.monotonic()
+        await _memory_enqueue(request.username, "hindsight", user_query)
+        timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
+
+    timing["total"] = round((time.monotonic() - t0) * 1000)
+    return {"message": response.messages[0].text, "usage": usage, "timing_ms": timing, "memory_mode": request.memory_mode}
 
 @app.post("/hindsight/memories")
 async def hindsight_get_memories(request: ChatRequest):
@@ -486,46 +685,80 @@ async def foundry(request: ChatRequest):
     
     If not configured, falls back to GPT-4 client.
     """
-    print(f"Foundry request: {request.username}")
+    print(f"Foundry request: {request.username} memory_mode={request.memory_mode}")
+    t0 = time.monotonic()
+    timing = {"memory_retrieve": 0, "memory_enqueue": 0, "llm": 0}
 
-    # HOT path: inject shared memory context
     user_query = request.messages[-1].content if request.messages else ""
-    mem_context = await _memory_retrieve(request.username, "foundry", user_query)
 
-    # If Foundry is configured, reference the existing Foundry portal agent.
+    if request.memory_mode == "hot-cold":
+        # Hot/Cold path: bypass Foundry's Memory Store; use raw client + Azure Search.
+        t_mem = time.monotonic()
+        mem_context = await _memory_retrieve(request.username, "foundry", user_query)
+        timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+
+        messages = _create_system_context(request.username, request.messages, instructions=AGENT_INSTRUCTIONS)
+        if mem_context:
+            messages.insert(1, ChatMessage(role="system", text=mem_context))
+
+        t_llm = time.monotonic()
+        response = await gpt_4_client.get_response(messages)
+        timing["llm"] = round((time.monotonic() - t_llm) * 1000)
+        usage = _normalize_usage(response.usage_details)
+
+        t_enq = time.monotonic()
+        await _memory_enqueue(request.username, "foundry", user_query)
+        timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
+
+        timing["total"] = round((time.monotonic() - t0) * 1000)
+        return {"message": response.messages[0].text, "usage": usage, "timing_ms": timing, "memory_mode": request.memory_mode}
+
+    # Standard path: use Foundry's built-in Memory Store (or GPT-4 fallback)
+    # PLUS the shared Azure Search memory layer (retrieve + enqueue).
+
+    # HOT path: shared memory retrieval
+    t_mem = time.monotonic()
+    mem_context = await _memory_retrieve(request.username, "foundry", user_query)
+    timing["memory_retrieve"] = round((time.monotonic() - t_mem) * 1000)
+
     if foundry_agent_wrapper and foundry_agent_wrapper.is_configured:
         try:
             openai_input = _create_openai_input(request.username, request.messages)
-            # Prepend shared memory context as a user-role preamble.
             if mem_context:
-                openai_input.insert(0, {"role": "user", "content": f"[Memory context]: {mem_context}"})
+                openai_input.insert(1, {"role": "system", "content": mem_context})
+            t_llm = time.monotonic()
             result = await foundry_agent_wrapper.chat(input_messages=openai_input, username=request.username)
+            timing["llm"] = round((time.monotonic() - t_llm) * 1000)
             usage = _normalize_usage(result.usage)
 
-            # COLD path: enqueue memory event (fire-and-forget)
-            if user_query:
-                await _memory_enqueue(request.username, "foundry", user_query)
+            t_enq = time.monotonic()
+            await _memory_enqueue(request.username, "foundry", user_query)
+            timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
 
-            return {"message": result.text, "usage": usage}
+            timing["total"] = round((time.monotonic() - t0) * 1000)
+            return {"message": result.text, "usage": usage, "timing_ms": timing, "memory_mode": request.memory_mode}
         except Exception as e:
-            # If Foundry is misconfigured or the SDK surface differs, do not hard-fail the API.
-            # Fall back to GPT-4 client but include a diagnostic note.
             print(f"Warning: Foundry chat failed, falling back to GPT-4 client: {type(e).__name__}: {e}")
 
-    # Otherwise, fall back to the local Azure OpenAI client (useful for dev/test).
-    messages = _create_system_context(request.username, request.messages)
+    # Fallback to GPT-4 client.
+    messages = _create_system_context(request.username, request.messages, instructions=AGENT_INSTRUCTIONS)
     if mem_context:
         messages.insert(1, ChatMessage(role="system", text=mem_context))
+    t_llm = time.monotonic()
     response = await gpt_4_client.get_response(messages)
+    timing["llm"] = round((time.monotonic() - t_llm) * 1000)
     usage = _normalize_usage(response.usage_details)
 
-    # COLD path: enqueue memory event (fire-and-forget)
-    if user_query:
-        await _memory_enqueue(request.username, "foundry", user_query)
+    t_enq = time.monotonic()
+    await _memory_enqueue(request.username, "foundry", user_query)
+    timing["memory_enqueue"] = round((time.monotonic() - t_enq) * 1000)
 
+    timing["total"] = round((time.monotonic() - t0) * 1000)
     return {
         "message": response.messages[0].text,
         "usage": usage,
+        "timing_ms": timing,
+        "memory_mode": request.memory_mode,
         "note": (
             "Foundry not configured or Foundry call failed; returned response from GPT-4 client instead. "
             "Check AZURE_FOUNDRY_ENDPOINT/AZURE_FOUNDRY_AGENT_NAME, Azure AD auth, and azure-ai-projects version."
